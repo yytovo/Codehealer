@@ -105,6 +105,63 @@ class GitHubConnector:
             body=issue.body or "",
         )
 
+    def get_next_open_issue(
+        self,
+        *,
+        label: str,
+        skip_labels: Iterable[str] = ("codehealer-pr-created", "codehealer-failed"),
+    ) -> IssuePayload:
+        """Return the oldest open issue with the given label.
+
+        The label is an explicit opt-in gate. CodeHealer should not blindly
+        attempt every open issue in a real repository.
+        """
+
+        try:
+            issues = self._repo.get_issues(
+                state="open",
+                labels=[label],
+                sort="created",
+                direction="asc",
+            )
+        except GithubException as exc:
+            raise RuntimeError(f"读取带有标签 {label!r} 的 Issue 失败。") from exc
+
+        skipped = set(skip_labels)
+        for issue in issues:
+            if issue.pull_request is not None:
+                continue
+
+            issue_labels = {item.name for item in issue.labels}
+            if issue_labels & skipped:
+                continue
+
+            return self._issue_to_payload(issue)
+
+        raise RuntimeError(f"没有找到带有标签 {label!r} 的待处理 open Issue。")
+
+    def comment_on_issue(self, issue_number: int, body: str) -> None:
+        """在 Issue 下追加一条运行结果评论；失败时不影响修复主流程。"""
+
+        try:
+            issue = self._repo.get_issue(number=issue_number)
+            issue.create_comment(body)
+        except GithubException as exc:
+            print(f"[Issue] 添加评论失败，已跳过: Issue #{issue_number} ({exc.status})")
+
+    def add_issue_labels(self, issue_number: int, *labels: str) -> None:
+        """给 Issue 打标签；标签不存在或权限不足时只打印提醒，不中断主流程。"""
+
+        clean_labels = [label for label in labels if label]
+        if not clean_labels:
+            return
+
+        try:
+            issue = self._repo.get_issue(number=issue_number)
+            issue.add_to_labels(*clean_labels)
+        except GithubException as exc:
+            print(f"[Issue] 添加标签失败，已跳过: {clean_labels} ({exc.status})")
+
     def get_file_content(self, file_path: str, *, ref: Optional[str] = None) -> str:
         """读取仓库中指定文件的文本内容。"""
 
@@ -226,6 +283,14 @@ class GitHubConnector:
         if content.decoded_content is None:
             raise RuntimeError(f"文件 {content.path} 内容为空或无法解码。")
         return content.decoded_content.decode("utf-8")
+
+    @staticmethod
+    def _issue_to_payload(issue: Issue) -> IssuePayload:
+        return IssuePayload(
+            number=issue.number,
+            title=issue.title,
+            body=issue.body or "",
+        )
 
     @staticmethod
     def _should_ignore_directory(path: str) -> bool:
@@ -376,6 +441,28 @@ def _get_required_env(name: str) -> str:
     return value
 
 
+def _get_optional_env(name: str) -> Optional[str]:
+    value = os.getenv(name)
+    if value is None:
+        return None
+
+    value = value.strip()
+    return value or None
+
+
+def _select_issue(connector: GitHubConnector) -> IssuePayload:
+    issue_number = _get_optional_env("TARGET_ISSUE_NUMBER")
+    if issue_number is not None:
+        print(f"[Issue] 使用手动指定的 Issue: #{issue_number}")
+        return connector.get_issue(int(issue_number))
+
+    issue_label = os.getenv("TARGET_ISSUE_LABEL", "codehealer")
+    print(f"[Issue] 自动扫描带有标签 {issue_label!r} 的 open Issue")
+    issue = connector.get_next_open_issue(label=issue_label)
+    print(f"[Issue] 自动领取 Issue #{issue.number}: {issue.title}")
+    return issue
+
+
 def _build_llm() -> ChatOpenAI:
     openai_api_key = _get_required_env("OPENAI_API_KEY")
     openai_api_base = os.getenv("OPENAI_API_BASE")
@@ -394,10 +481,9 @@ def main() -> None:
 
     github_token = _get_required_env("GITHUB_TOKEN")
     target_repo = _get_required_env("TARGET_REPO")
-    issue_number = int(_get_required_env("TARGET_ISSUE_NUMBER"))
 
     connector = GitHubConnector(token=github_token, repo_full_name=target_repo)
-    issue = connector.get_issue(issue_number)
+    issue = _select_issue(connector)
 
     retriever = CodebaseRetriever(connector=connector)
     retriever.build_vector_store()
@@ -429,7 +515,16 @@ def main() -> None:
     print(result["sandbox_output"])
 
     if not result["is_resolved"]:
-        print("测试未通过，已停止创建 PR。")
+        failure_comment = (
+            "CodeHealer 已尝试自动修复，但沙箱测试仍未通过，因此未创建 PR。\n\n"
+            "最后一次沙箱输出：\n"
+            "```text\n"
+            f"{result['sandbox_output'][:6000]}\n"
+            "```"
+        )
+        connector.comment_on_issue(issue.number, failure_comment)
+        connector.add_issue_labels(issue.number, "codehealer-failed")
+        print("测试未通过，已停止创建 PR，并已在 Issue 中记录失败原因。")
         return
 
     branch_name = f"codehealer/issue-{issue.number}-{target_file_path.rsplit('/', 1)[-1]}-fix"
@@ -446,6 +541,17 @@ def main() -> None:
             "沙箱验证结果：pytest 已通过。"
         ),
     )
+    connector.comment_on_issue(
+        issue.number,
+        (
+            "CodeHealer 已创建候选修复 PR：\n\n"
+            f"{pr.html_url}\n\n"
+            f"定位文件：`{target_file_path}`\n"
+            f"修复迭代次数：{result['iterations']}\n"
+            "沙箱验证：pytest passed"
+        ),
+    )
+    connector.add_issue_labels(issue.number, "codehealer-pr-created")
     print(f"已创建 PR: {pr.html_url}")
 
 
